@@ -1,0 +1,380 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "./InterestRateModel.sol";
+
+contract LendingPool is Ownable, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    uint256 public constant PRECISION = 1e18;
+    uint256 public constant PERCENTAGE_BASE = 10000;
+
+    struct AssetConfig {
+        uint256 ltv;
+        uint256 liquidationThreshold;
+        uint256 price;
+        uint8 decimals;
+        bool isActive;
+    }
+
+    struct AssetData {
+        uint256 totalDeposits;
+        uint256 totalBorrows;
+        uint256 borrowIndex;
+        uint256 supplyIndex;
+        uint256 lastUpdateTimestamp;
+    }
+
+    struct UserAssetData {
+        uint256 depositShares;
+        uint256 borrowShares;
+        bool usingAsCollateral;
+    }
+
+    InterestRateModel public interestRateModel;
+    address[] public assetList;
+
+    mapping(address => AssetConfig) public assetConfigs;
+    mapping(address => AssetData) public assetData;
+    mapping(address => mapping(address => UserAssetData)) public userAssetData;
+
+    event AssetAdded(address indexed asset, uint256 ltv, uint256 liquidationThreshold);
+    event AssetPriceUpdated(address indexed asset, uint256 newPrice);
+    event Deposit(address indexed user, address indexed asset, uint256 amount, uint256 shares);
+    event Withdraw(address indexed user, address indexed asset, uint256 amount, uint256 shares);
+    event Borrow(address indexed user, address indexed asset, uint256 amount, uint256 shares);
+    event Repay(address indexed user, address indexed asset, uint256 amount, uint256 shares);
+
+    constructor(address interestRateModel_) Ownable(msg.sender) {
+        interestRateModel = InterestRateModel(interestRateModel_);
+    }
+
+    function addAsset(
+        address asset,
+        uint256 ltv,
+        uint256 liquidationThreshold,
+        uint256 price,
+        uint8 decimals
+    ) external onlyOwner {
+        require(!assetConfigs[asset].isActive, "Asset already added");
+        require(ltv < liquidationThreshold, "Invalid LTV");
+        require(liquidationThreshold <= PERCENTAGE_BASE, "Invalid threshold");
+
+        assetConfigs[asset] = AssetConfig({
+            ltv: ltv,
+            liquidationThreshold: liquidationThreshold,
+            price: price,
+            decimals: decimals,
+            isActive: true
+        });
+
+        assetData[asset] = AssetData({
+            totalDeposits: 0,
+            totalBorrows: 0,
+            borrowIndex: PRECISION,
+            supplyIndex: PRECISION,
+            lastUpdateTimestamp: block.timestamp
+        });
+
+        assetList.push(asset);
+        emit AssetAdded(asset, ltv, liquidationThreshold);
+    }
+
+    function setAssetPrice(address asset, uint256 price) external onlyOwner {
+        require(assetConfigs[asset].isActive, "Asset not active");
+        assetConfigs[asset].price = price;
+        emit AssetPriceUpdated(asset, price);
+    }
+
+    function accrueInterest(address asset) public {
+        AssetData storage data = assetData[asset];
+
+        if (block.timestamp == data.lastUpdateTimestamp) {
+            return;
+        }
+
+        if (data.totalDeposits == 0) {
+            data.lastUpdateTimestamp = block.timestamp;
+            return;
+        }
+
+        uint256 cash = IERC20(asset).balanceOf(address(this));
+        uint256 borrowRatePerSecond = interestRateModel.getBorrowRatePerSecond(cash, data.totalBorrows);
+        uint256 supplyRatePerSecond = interestRateModel.getSupplyRatePerSecond(cash, data.totalBorrows);
+
+        uint256 timeDelta = block.timestamp - data.lastUpdateTimestamp;
+
+        uint256 borrowInterestFactor = borrowRatePerSecond * timeDelta;
+        uint256 supplyInterestFactor = supplyRatePerSecond * timeDelta;
+
+        data.borrowIndex = data.borrowIndex + (data.borrowIndex * borrowInterestFactor / PRECISION);
+        data.supplyIndex = data.supplyIndex + (data.supplyIndex * supplyInterestFactor / PRECISION);
+
+        data.totalBorrows = data.totalBorrows + (data.totalBorrows * borrowInterestFactor / PRECISION);
+
+        data.lastUpdateTimestamp = block.timestamp;
+    }
+
+    function getAssetList() external view returns (address[] memory) {
+        return assetList;
+    }
+
+    function getUserDepositBalance(address user, address asset) public view returns (uint256) {
+        UserAssetData storage userData = userAssetData[user][asset];
+        AssetData storage data = assetData[asset];
+        if (userData.depositShares == 0) {
+            return 0;
+        }
+        return (userData.depositShares * data.supplyIndex) / PRECISION;
+    }
+
+    function getUserBorrowBalance(address user, address asset) public view returns (uint256) {
+        UserAssetData storage userData = userAssetData[user][asset];
+        AssetData storage data = assetData[asset];
+        if (userData.borrowShares == 0) {
+            return 0;
+        }
+        return (userData.borrowShares * data.borrowIndex) / PRECISION;
+    }
+
+    function getAssetPrice(address asset) public view returns (uint256) {
+        return assetConfigs[asset].price;
+    }
+
+    function normalizeAmount(address asset, uint256 amount) internal view returns (uint256) {
+        uint8 decimals = assetConfigs[asset].decimals;
+        if (decimals < 18) {
+            return amount * (10 ** (18 - decimals));
+        }
+        return amount;
+    }
+
+    function getUserCollateralValue(address user) public view returns (uint256) {
+        uint256 totalValue = 0;
+        for (uint256 i = 0; i < assetList.length; i++) {
+            address asset = assetList[i];
+            UserAssetData storage userData = userAssetData[user][asset];
+            if (userData.usingAsCollateral && userData.depositShares > 0) {
+                uint256 balance = getUserDepositBalance(user, asset);
+                uint256 normalizedBalance = normalizeAmount(asset, balance);
+                uint256 price = assetConfigs[asset].price;
+                totalValue += (normalizedBalance * price) / PRECISION;
+            }
+        }
+        return totalValue;
+    }
+
+    function getUserBorrowValue(address user) public view returns (uint256) {
+        uint256 totalValue = 0;
+        for (uint256 i = 0; i < assetList.length; i++) {
+            address asset = assetList[i];
+            uint256 balance = getUserBorrowBalance(user, asset);
+            if (balance > 0) {
+                uint256 normalizedBalance = normalizeAmount(asset, balance);
+                uint256 price = assetConfigs[asset].price;
+                totalValue += (normalizedBalance * price) / PRECISION;
+            }
+        }
+        return totalValue;
+    }
+
+    function getHealthFactor(address user) public view returns (uint256) {
+        uint256 borrowValue = getUserBorrowValue(user);
+        if (borrowValue == 0) {
+            return type(uint256).max;
+        }
+
+        uint256 liquidationValue = 0;
+        for (uint256 i = 0; i < assetList.length; i++) {
+            address asset = assetList[i];
+            UserAssetData storage userData = userAssetData[user][asset];
+            if (userData.usingAsCollateral && userData.depositShares > 0) {
+                uint256 balance = getUserDepositBalance(user, asset);
+                uint256 normalizedBalance = normalizeAmount(asset, balance);
+                uint256 price = assetConfigs[asset].price;
+                uint256 threshold = assetConfigs[asset].liquidationThreshold;
+                liquidationValue += (normalizedBalance * price * threshold) / (PRECISION * PERCENTAGE_BASE);
+            }
+        }
+
+        return (liquidationValue * PRECISION) / borrowValue;
+    }
+
+    function getMaxBorrowValue(address user) public view returns (uint256) {
+        uint256 maxBorrow = 0;
+        for (uint256 i = 0; i < assetList.length; i++) {
+            address asset = assetList[i];
+            UserAssetData storage userData = userAssetData[user][asset];
+            if (userData.usingAsCollateral && userData.depositShares > 0) {
+                uint256 balance = getUserDepositBalance(user, asset);
+                uint256 normalizedBalance = normalizeAmount(asset, balance);
+                uint256 price = assetConfigs[asset].price;
+                uint256 ltv = assetConfigs[asset].ltv;
+                maxBorrow += (normalizedBalance * price * ltv) / (PRECISION * PERCENTAGE_BASE);
+            }
+        }
+        return maxBorrow;
+    }
+
+    function deposit(address asset, uint256 amount) external nonReentrant {
+        require(assetConfigs[asset].isActive, "Asset not active");
+        require(amount > 0, "Amount must be greater than 0");
+
+        accrueInterest(asset);
+
+        AssetData storage data = assetData[asset];
+        UserAssetData storage userData = userAssetData[msg.sender][asset];
+
+        uint256 shares;
+        if (data.totalDeposits == 0) {
+            shares = amount;
+        } else {
+            shares = (amount * PRECISION) / data.supplyIndex;
+        }
+
+        IERC20(asset).safeTransferFrom(msg.sender, address(this), amount);
+
+        userData.depositShares += shares;
+        userData.usingAsCollateral = true;
+        data.totalDeposits += amount;
+
+        emit Deposit(msg.sender, asset, amount, shares);
+    }
+
+    function withdraw(address asset, uint256 amount) external nonReentrant {
+        require(assetConfigs[asset].isActive, "Asset not active");
+        require(amount > 0, "Amount must be greater than 0");
+
+        accrueInterest(asset);
+
+        AssetData storage data = assetData[asset];
+        UserAssetData storage userData = userAssetData[msg.sender][asset];
+
+        uint256 userBalance = getUserDepositBalance(msg.sender, asset);
+        require(userBalance >= amount, "Insufficient balance");
+
+        uint256 shares = (amount * PRECISION) / data.supplyIndex;
+        require(userData.depositShares >= shares, "Insufficient shares");
+
+        userData.depositShares -= shares;
+        data.totalDeposits -= amount;
+
+        if (userData.borrowShares > 0 || getUserBorrowBalance(msg.sender, asset) > 0) {
+            uint256 healthFactor = getHealthFactor(msg.sender);
+            require(healthFactor >= PRECISION, "Health factor too low");
+        }
+
+        IERC20(asset).safeTransfer(msg.sender, amount);
+
+        emit Withdraw(msg.sender, asset, amount, shares);
+    }
+
+    function setCollateralEnabled(address asset, bool enabled) external {
+        require(assetConfigs[asset].isActive, "Asset not active");
+        userAssetData[msg.sender][asset].usingAsCollateral = enabled;
+
+        if (!enabled && getUserBorrowValue(msg.sender) > 0) {
+            uint256 healthFactor = getHealthFactor(msg.sender);
+            require(healthFactor >= PRECISION, "Health factor too low");
+        }
+    }
+
+    function borrow(address asset, uint256 amount) external nonReentrant {
+        require(assetConfigs[asset].isActive, "Asset not active");
+        require(amount > 0, "Amount must be greater than 0");
+
+        accrueInterest(asset);
+
+        AssetData storage data = assetData[asset];
+        UserAssetData storage userData = userAssetData[msg.sender][asset];
+
+        uint256 availableLiquidity = IERC20(asset).balanceOf(address(this));
+        require(availableLiquidity >= amount, "Insufficient liquidity");
+
+        uint256 shares;
+        if (data.totalBorrows == 0) {
+            shares = amount;
+        } else {
+            shares = (amount * PRECISION) / data.borrowIndex;
+        }
+
+        userData.borrowShares += shares;
+        data.totalBorrows += amount;
+
+        uint256 maxBorrowValue = getMaxBorrowValue(msg.sender);
+        uint256 currentBorrowValue = getUserBorrowValue(msg.sender);
+        require(currentBorrowValue <= maxBorrowValue, "Exceeds max borrow capacity");
+
+        uint256 healthFactor = getHealthFactor(msg.sender);
+        require(healthFactor >= PRECISION, "Health factor too low");
+
+        IERC20(asset).safeTransfer(msg.sender, amount);
+
+        emit Borrow(msg.sender, asset, amount, shares);
+    }
+
+    function repay(address asset, uint256 amount) external nonReentrant {
+        require(assetConfigs[asset].isActive, "Asset not active");
+        require(amount > 0, "Amount must be greater than 0");
+
+        accrueInterest(asset);
+
+        AssetData storage data = assetData[asset];
+        UserAssetData storage userData = userAssetData[msg.sender][asset];
+
+        uint256 userBorrowBalance = getUserBorrowBalance(msg.sender, asset);
+        require(userBorrowBalance > 0, "No borrow to repay");
+
+        uint256 repayAmount = amount > userBorrowBalance ? userBorrowBalance : amount;
+
+        uint256 shares = (repayAmount * PRECISION) / data.borrowIndex;
+
+        IERC20(asset).safeTransferFrom(msg.sender, address(this), repayAmount);
+
+        userData.borrowShares -= shares;
+        data.totalBorrows -= repayAmount;
+
+        emit Repay(msg.sender, asset, repayAmount, shares);
+    }
+
+    function getAvailableLiquidity(address asset) external view returns (uint256) {
+        return IERC20(asset).balanceOf(address(this));
+    }
+
+    function getAssetData(address asset) external view returns (
+        uint256 totalDeposits,
+        uint256 totalBorrows,
+        uint256 borrowIndex,
+        uint256 supplyIndex,
+        uint256 borrowRate,
+        uint256 supplyRate
+    ) {
+        AssetData storage data = assetData[asset];
+        uint256 cash = IERC20(asset).balanceOf(address(this));
+        return (
+            data.totalDeposits,
+            data.totalBorrows,
+            data.borrowIndex,
+            data.supplyIndex,
+            interestRateModel.getBorrowRatePerYear(cash, data.totalBorrows),
+            interestRateModel.getSupplyRatePerYear(cash, data.totalBorrows)
+        );
+    }
+
+    function getUserAccountData(address user) external view returns (
+        uint256 totalCollateralValue,
+        uint256 totalBorrowValue,
+        uint256 availableBorrowValue,
+        uint256 healthFactor
+    ) {
+        totalCollateralValue = getUserCollateralValue(user);
+        totalBorrowValue = getUserBorrowValue(user);
+        uint256 maxBorrow = getMaxBorrowValue(user);
+        availableBorrowValue = maxBorrow > totalBorrowValue ? maxBorrow - totalBorrowValue : 0;
+        healthFactor = getHealthFactor(user);
+    }
+}
