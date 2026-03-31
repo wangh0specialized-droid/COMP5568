@@ -1,0 +1,45 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+
+  --color-primary: #7dd3fc;
+  --color-primary-foreground: #001f2e;
+  --color-secondary: #88b4cc;
+  --color-tertiary: #c8a0f0;
+  --color-background: #0a0e1a;
+  --color-surface: #0f1524;
+  --color-surface-bright: #1a2438;
+  --color-surface-dim: #0f1524;
+  --color-on-surface: #e0e8f0;
+  --color-on-surface-variant: #a0b4c4;
+  --color-error: #ff6b6b;
+  
+  --radius-lg: 1rem;
+  --radius-xl: 1.5rem;
+}
+
+@layer base {
+  body {
+    @apply bg-background text-on-surface font-sans antialiased;
+  }
+}
+
+@layer components {
+  .glass-card {
+    background: rgba(15, 21, 36, 0.6);
+    backdrop-filter: blur(16px);
+    border: 1px solid rgba(125, 211, 252, 0.1);
+  }
+
+  .glass-elevated {
+    background: rgba(15, 21, 36, 0.75);
+    backdrop-filter: blur(24px);
+    border: 1px solid rgba(125, 211, 252, 0.15);
+  }
+
+  .glow-subtle {
+    box-shadow: 0 0 30px rgba(125, 211, 252, 0.05);
+  }
+}
