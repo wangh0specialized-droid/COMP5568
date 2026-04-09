@@ -574,8 +574,8 @@ contract LendingPool is Ownable, ReentrancyGuard {
         address collateralAsset,
         uint256 repayAmount
     ) internal view returns (uint256) {
-        uint256 priceDebt = assetConfigs[debtAsset].price;
-        uint256 priceColl = assetConfigs[collateralAsset].price;
+        uint256 priceDebt = getAssetPrice(debtAsset);
+        uint256 priceColl = getAssetPrice(collateralAsset);
 
         uint256 collateralSeizeValue = (repayAmount * priceDebt * LIQUIDATION_BONUS) / (PRECISION * PERCENTAGE_BASE);
         return (collateralSeizeValue * PRECISION) / priceColl;
